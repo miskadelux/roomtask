@@ -1,0 +1,64 @@
+services:
+  db:
+    image: mysql:8.4
+    container_name: roomtask-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: roomtask
+      MYSQL_USER: roomtask
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [roomtask]
+
+  api:
+    build: ./backend
+    container_name: roomtask-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: mysql+pymysql://roomtask:${MYSQL_PASSWORD}@db:3306/roomtask
+      UPLOAD_DIR: /app/uploads
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      DISCORD_BOARD_API_KEY: ${DISCORD_BOARD_API_KEY:-}
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [roomtask]
+
+  web:
+    build: ./frontend
+    container_name: roomtask-web
+    restart: unless-stopped
+    ports:
+      - "8088:80"
+    depends_on: [api]
+    networks: [roomtask]
+
+  bot:
+    build: ./bot
+    container_name: roomtask-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on: [api]
+    networks: [roomtask]
+    profiles: ["discord"]
+
+volumes:
+  mysql_data:
+  uploads:
+
+networks:
+  roomtask:
+    driver: bridge

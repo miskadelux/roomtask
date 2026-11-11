@@ -1,0 +1,10 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+SQLAlchemy==2.0.40
+PyMySQL==1.1.1
+python-jose[cryptography]==3.4.0
+passlib[argon2]==1.7.4
+python-multipart==0.0.20
+pydantic[email]==2.11.4
+rapidfuzz==3.13.0
+httpx==0.28.1
