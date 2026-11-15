@@ -44,6 +44,10 @@ class CommentIn(BaseModel):
     body: str = Field(min_length=1, max_length=4000)
 
 
+class CompleteTicketIn(BaseModel):
+    completion_description: str = Field(min_length=1, max_length=4000)
+
+
 class UserIn(BaseModel):
     username: str = Field(min_length=3, max_length=80)
     password: str = Field(min_length=12)

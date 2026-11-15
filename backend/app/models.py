@@ -26,6 +26,8 @@ class Room(Base):
 class Ticket(Base):
     __tablename__ = "tickets"
     id: Mapped[int] = mapped_column(primary_key=True)
+    merged_into_id: Mapped[int | None] = mapped_column(
+    ForeignKey("tickets.id"), nullable=True, index=True)
     type: Mapped[str] = mapped_column(String(20))  # fault / request
     title: Mapped[str] = mapped_column(String(180))
     description: Mapped[str] = mapped_column(Text)

@@ -6,7 +6,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Req
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func
+from sqlalchemy import select, func, inspect, text
 from rapidfuzz import fuzz
 
 from .database import Base, engine, get_db, SessionLocal
@@ -17,6 +17,7 @@ from .schemas import (
     TicketOut,
     RoomIn,
     CommentIn,
+    CompleteTicketIn,
     UserIn,
     UserUpdateIn,
     UserPasswordIn,
@@ -33,9 +34,27 @@ app = FastAPI(title="RoomTask API", version="0.1.0")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+def migrate_ticket_merge():
+    inspector = inspect(engine)
+    columns = [column["name"] for column in inspector.get_columns("tickets")]
+
+    if "merged_into_id" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE tickets ADD COLUMN merged_into_id INTEGER NULL"
+            ))
+            conn.execute(text(
+                "CREATE INDEX ix_tickets_merged_into_id ON tickets (merged_into_id)"
+            ))
+            conn.execute(text(
+                "ALTER TABLE tickets ADD CONSTRAINT fk_tickets_merged_into "
+                "FOREIGN KEY (merged_into_id) REFERENCES tickets(id)"
+            ))
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
+    migrate_ticket_merge()
     with SessionLocal() as db:
         if not db.query(User).filter_by(role="admin").first():
             username = os.getenv("ADMIN_USERNAME", "admin")
@@ -64,15 +83,26 @@ def create_report(db, kind, room_id, description, title, source="web", discord_i
     room = db.get(Room, room_id) if room_id else None
     if room_id and (not room or not room.active):
         raise HTTPException(400, "Okänt eller inaktivt rum")
+
     normalized = " ".join(description.lower().split())
-    candidates = db.query(Ticket).filter(Ticket.type == kind, Ticket.status.in_(["new", "in_progress", "done"])).order_by(Ticket.created_at.desc()).limit(150).all()
+    candidates = db.query(Ticket).filter(
+            Ticket.type == kind,
+            Ticket.status.in_(["new", "in_progress", "done"]),
+            Ticket.merged_into_id.is_(None)
+                ).order_by(Ticket.created_at.desc()).limit(150).all()
+
     matches = []
+
     for t in candidates:
         if room_id != t.room_id:
             continue
-        score = fuzz.token_set_ratio(normalized, " ".join(t.description.lower().split()))
-        if score >= 82:
+
+        score = fuzz.WRatio(normalized, " ".join(t.description.lower().split()))        
+        if score >= 50:
             matches.append((score, t))
+
+
+
     # Keep each submission as a separate report. A strong candidate is flagged for admin review,
     # but it is NOT automatically merged.
     ticket = Ticket(type=kind, title=title[:180], description=description, room_id=room_id, status="new")
@@ -88,7 +118,7 @@ def create_report(db, kind, room_id, description, title, source="web", discord_i
     if matches:
         log(db, ticket.id, "possible_duplicate_detected", "system",
             details="; ".join(f"ticket={t.id},score={s}" for s,t in matches[:5]))
-    return ticket, report
+    return ticket, report, matches
 
 @app.get("/health")
 def health():
@@ -104,7 +134,10 @@ def discord_board(x_roomtask_board_key: str | None = Header(default=None), db: S
     statuses = ("new", "in_progress", "done")
     result = {"updated_at": datetime.now(timezone.utc).isoformat(), "columns": {}}
     for status in statuses:
-        query = db.query(Ticket).filter(Ticket.status == status).order_by(
+        query = db.query(Ticket).filter(
+            Ticket.status == status,
+            Ticket.merged_into_id.is_(None)
+        ).order_by(
             Ticket.completed_at.desc() if status == "done" else Ticket.created_at.desc()
         )
         total = query.count()
@@ -144,6 +177,14 @@ def me(user: User = Depends(worker_or_admin)):
 def rooms(db: Session = Depends(get_db)):
     return [{"id": r.id, "name": r.name} for r in db.query(Room).filter_by(active=True).order_by(Room.name).all()]
 
+
+@app.get("/api/public/rooms/{qr_token}")
+def public_room_by_qr(qr_token: str, db: Session = Depends(get_db)):
+    room = db.query(Room).filter_by(qr_token=qr_token, active=True).first()
+    if not room:
+        raise HTTPException(404, "Okänt eller inaktivt rum")
+    return {"id": room.id, "name": room.name}
+
 @app.post("/api/public/reports")
 async def public_report(
     request: Request,
@@ -159,7 +200,7 @@ async def public_report(
     if len(title.strip()) < 3 or len(description.strip()) < 5:
         raise HTTPException(400, "Rubrik eller beskrivning är för kort")
     # Simple per-IP throttle; use a proper reverse-proxy/API rate limiter in production.
-    ticket, report = create_report(db, kind, room_id, description.strip(), title.strip())
+    ticket, report, matches = create_report(db, kind, room_id, description.strip(), title.strip())
     for upload in files[:4]:
         if upload.content_type not in ALLOWED_TYPES:
             raise HTTPException(400, "Endast JPG, PNG och WebP tillåts")
@@ -172,13 +213,41 @@ async def public_report(
                           original_name=(upload.filename or "bild")[:255],
                           content_type=upload.content_type, size=len(content)))
     db.commit()
-    return {"ticket_id": ticket.id, "report_id": report.id, "status": ticket.status,
-            "possible_duplicates": [{"ticket_id": t.id, "score": s} for s,t in []]}
+
+    webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if webhook:
+        try:
+            import httpx
+
+            room_name = ticket.room.name if ticket.room else "Okänd plats"
+            kind_name = "Felanmälan" if ticket.type == "fault" else "Önskemål"
+
+            message = (
+                f"🔔 **Nytt ärende i RoomTask #{ticket.id}**\n"
+                f"**Typ:** {kind_name}\n"
+                f"**Rum:** {room_name}\n"
+                f"**Rubrik:** {ticket.title}\n"
+                f"**Beskrivning:** {ticket.description[:1000]}"
+            )
+
+            httpx.post(
+                webhook,
+                json={
+                    "content": message,
+                    "allowed_mentions": {"parse": []}
+                },
+                timeout=5.0,
+            ).raise_for_status()
+
+        except Exception as exc:
+            print(f"Discord new ticket notification failed for ticket #{ticket.id}: {exc}")
+
+    return {"ticket_id": ticket.id, "report_id": report.id, "status": ticket.status,}
 
 @app.get("/api/tickets", response_model=list[TicketOut])
 def list_tickets(status: str | None = None, kind: str | None = None,
                  user: User = Depends(worker_or_admin), db: Session = Depends(get_db)):
-    q = db.query(Ticket)
+    q = db.query(Ticket).filter(Ticket.merged_into_id.is_(None))
     if status: q = q.filter(Ticket.status == status)
     if kind: q = q.filter(Ticket.type == kind)
     return [ticket_to_out(t, db) for t in q.order_by(Ticket.created_at.desc()).all()]
@@ -188,6 +257,46 @@ def get_ticket(ticket_id: int, user: User = Depends(worker_or_admin), db: Sessio
     t = db.get(Ticket, ticket_id)
     if not t: raise HTTPException(404, "Ärendet finns inte")
     return ticket_to_out(t, db)
+
+@app.get("/api/tickets/{ticket_id}/details")
+def ticket_details(
+    ticket_id: int,
+    user: User = Depends(worker_or_admin),
+    db: Session = Depends(get_db)
+):
+    ticket = db.get(Ticket, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ärendet finns inte")
+
+    reports = db.query(Report).filter_by(
+        ticket_id=ticket_id
+    ).order_by(Report.created_at.asc()).all()
+
+    attachments = db.query(Attachment).filter_by(
+        ticket_id=ticket_id
+    ).order_by(Attachment.created_at.asc()).all()
+
+    return {
+        "reports": [
+            {
+                "id": report.id,
+                "source": report.source,
+                "reporter": report.reporter_label,
+                "created_at": report.created_at.isoformat(),
+                "description": report.original_description,
+                "attachments": [
+                    {
+                        "id": attachment.id,
+                        "name": attachment.original_name,
+                        "content_type": attachment.content_type,
+                    }
+                    for attachment in attachments
+                    if attachment.report_id == report.id
+                ],
+            }
+            for report in reports
+        ]
+    }
 
 @app.post("/api/tickets/{ticket_id}/claim")
 def claim(ticket_id: int, user: User = Depends(worker_or_admin), db: Session = Depends(get_db)):
@@ -208,19 +317,41 @@ def claim(ticket_id: int, user: User = Depends(worker_or_admin), db: Session = D
     db.commit()
     return {"ok": True, "ticket_id": t.id}
 
+
 @app.post("/api/tickets/{ticket_id}/complete")
-def complete(ticket_id: int, user: User = Depends(worker_or_admin), db: Session = Depends(get_db)):
+def complete(
+    ticket_id: int,
+    data: CompleteTicketIn,
+    user: User = Depends(worker_or_admin),
+    db: Session = Depends(get_db)
+):
+    description = data.completion_description.strip()
+
+    if not description:
+        raise HTTPException(400, "Du måste beskriva vad som har gjorts")
+
     t = db.get(Ticket, ticket_id)
-    if not t: raise HTTPException(404, "Ärendet finns inte")
-    if t.status != "in_progress": raise HTTPException(409, "Ärendet pågår inte")
+    if not t:
+        raise HTTPException(404, "Ärendet finns inte")
+    if t.status != "in_progress":
+        raise HTTPException(409, "Ärendet pågår inte")
     if user.role != "admin" and t.assigned_to != user.id:
         raise HTTPException(403, "Du kan bara avsluta ditt eget ärende")
+
     t.status = "done"
     t.completed_at = datetime.now(timezone.utc)
-    log(db, t.id, "completed", user.username, user.id)
+
+    log(
+        db,
+        t.id,
+        "completed",
+        user.username,
+        user.id,
+        details=f"Åtgärd utförd: {description}"
+    )
+
     db.commit()
 
-    # Optional Discord webhook notification. Configure DISCORD_WEBHOOK_URL in .env.
     webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
     if webhook:
         try:
@@ -228,27 +359,45 @@ def complete(ticket_id: int, user: User = Depends(worker_or_admin), db: Session 
             room_name = t.room.name if t.room else "Okänd plats"
             httpx.post(
                 webhook,
-                json={"content": f"✅ **RoomTask #{t.id} är klart**\\n{t.title} · {room_name}\\nAnsvarig: {user.username}"},
+                json={"content": f"✅ **RoomTask #{t.id} är klart**\n{t.title} · {room_name}\nAnsvarig: {user.username}"},
                 timeout=5.0,
             ).raise_for_status()
         except Exception as exc:
-            # Completion remains saved even if Discord is temporarily unavailable.
             print(f"Discord completion notification failed for ticket #{t.id}: {exc}")
+
     return {"ok": True}
 
 @app.post("/api/tickets/{ticket_id}/reopen")
-def reopen(ticket_id: int, user: User = Depends(worker_or_admin), db: Session = Depends(get_db)):
+def reopen_ticket(
+    ticket_id: int,
+    user: User = Depends(worker_or_admin),
+    db: Session = Depends(get_db)
+):
     t = db.get(Ticket, ticket_id)
-    if not t: raise HTTPException(404, "Ärendet finns inte")
-    if t.status != "done": raise HTTPException(409, "Endast färdiga ärenden kan återöppnas")
-    if user.role != "worker" or t.assigned_to != user.id:
-        raise HTTPException(403, "Endast ansvarig worker får återöppna efter dialog med admin")
-    active = db.query(Ticket).filter(Ticket.assigned_to == user.id, Ticket.status == "in_progress").first()
-    if active: raise HTTPException(409, f"Du har redan ett aktivt uppdrag (#{active.id})")
+
+    if not t:
+        raise HTTPException(404, "Ärendet finns inte")
+
+    if t.status != "done":
+        raise HTTPException(409, "Ärendet är inte avslutat")
+
+    if user.role != "admin" and t.assigned_to != user.id:
+        raise HTTPException(403, "Du kan bara återöppna dina egna ärenden")
+
     t.status = "in_progress"
     t.completed_at = None
-    log(db, t.id, "reopened_after_admin_discussion", user.username, user.id)
+
+    log(
+        db,
+        t.id,
+        "reopened_after_admin_discussion",
+        user.username,
+        user.id,
+        details="Ärendet återöppnades för fortsatt arbete."
+    )
+
     db.commit()
+
     return {"ok": True}
 
 @app.post("/api/tickets/{ticket_id}/comments")
@@ -260,6 +409,73 @@ def add_comment(ticket_id: int, data: CommentIn, user: User = Depends(worker_or_
     log(db, t.id, "comment_added", user.username, user.id)
     db.commit()
     return {"ok": True, "comment_id": c.id}
+
+
+@app.put("/api/tickets/{ticket_id}/comments/{comment_id}")
+def edit_comment(
+    ticket_id: int,
+    comment_id: int,
+    data: CommentIn,
+    user: User = Depends(worker_or_admin),
+    db: Session = Depends(get_db)
+):
+    comment = db.query(TicketComment).filter_by(
+        id=comment_id,
+        ticket_id=ticket_id
+    ).first()
+
+    if not comment:
+        raise HTTPException(404, "Kommentaren finns inte")
+
+    if user.role != "admin" and comment.user_id != user.id:
+        raise HTTPException(403, "Du får bara redigera dina egna kommentarer")
+
+    old_body = comment.body
+    comment.body = data.body
+
+    log(
+        db,
+        ticket_id,
+        "comment_edited",
+        user.username,
+        user.id,
+        f"comment_id={comment.id}\nFöre: {old_body}\nEfter: {data.body}"
+    )
+
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/tickets/{ticket_id}/comments/{comment_id}")
+def delete_comment(
+    ticket_id: int,
+    comment_id: int,
+    user: User = Depends(worker_or_admin),
+    db: Session = Depends(get_db)
+):
+    comment = db.query(TicketComment).filter_by(
+        id=comment_id,
+        ticket_id=ticket_id
+    ).first()
+
+    if not comment:
+        raise HTTPException(404, "Kommentaren finns inte")
+
+    if user.role != "admin" and comment.user_id != user.id:
+        raise HTTPException(403, "Du får bara ta bort dina egna kommentarer")
+
+    log(
+        db,
+        ticket_id,
+        "comment_deleted",
+        user.username,
+        user.id,
+        f"comment_id={comment.id}\nBorttagen kommentar: {comment.body}"
+    )
+
+    db.delete(comment)
+    db.commit()
+    return {"ok": True}
 
 @app.get("/api/tickets/{ticket_id}/history")
 def history(ticket_id: int, user: User = Depends(worker_or_admin), db: Session = Depends(get_db)):
@@ -274,21 +490,263 @@ def get_attachment(ticket_id: int, attachment_id: int, user: User = Depends(work
     if not a: raise HTTPException(404, "Bilden finns inte")
     return FileResponse(UPLOAD_DIR / a.stored_name, media_type=a.content_type, filename=a.original_name)
 
+@app.post("/api/admin/duplicates/scan")
+def scan_duplicates(user: User = Depends(admin_only), db: Session = Depends(get_db)):
+    tickets = (
+        db.query(Ticket)
+        .filter(
+            Ticket.status.in_(["new", "in_progress", "done"]),
+            Ticket.merged_into_id.is_(None)
+        )
+        .order_by(Ticket.id.asc())
+        .all()
+    )
+
+    reports = {
+        report.ticket_id: report
+        for report in db.query(Report).order_by(Report.id.asc()).all()
+    }
+
+    created = 0
+
+    for i, older in enumerate(tickets):
+        if older.room_id is None:
+            continue
+
+        for newer in tickets[i + 1:]:
+            if older.room_id != newer.room_id or older.type != newer.type:
+                continue
+
+            score = fuzz.WRatio(
+                " ".join(older.description.lower().split()),
+                " ".join(newer.description.lower().split())
+            )
+
+            if score < 50:
+                continue
+
+            report = reports.get(newer.id)
+            if not report:
+                continue
+
+            existing = db.query(DuplicateMatch).filter_by(
+                report_id=report.id,
+                candidate_ticket_id=older.id
+            ).first()
+
+            if existing:
+                continue
+
+            db.add(DuplicateMatch(
+                report_id=report.id,
+                candidate_ticket_id=older.id,
+                score=round(score)
+            ))
+
+            log(
+                db,
+                newer.id,
+                "possible_duplicate_detected",
+                "system",
+                details=f"ticket={older.id}; score={round(score)}; source=scan"
+            )
+
+            created += 1
+
+    db.commit()
+
+    return {"created": created, "checked_tickets": len(tickets)}
+
 @app.get("/api/admin/duplicates")
 def duplicates(user: User = Depends(admin_only), db: Session = Depends(get_db)):
-    rows = db.query(DuplicateMatch).filter_by(decision="pending").order_by(DuplicateMatch.score.desc()).all()
-    return [{"id": d.id, "report_id": d.report_id, "candidate_ticket_id": d.candidate_ticket_id, "score": d.score} for d in rows]
+    rows = (
+        db.query(DuplicateMatch)
+        .filter_by(decision="pending")
+        .order_by(DuplicateMatch.score.desc())
+        .all()
+    )
+
+    result = []
+
+    for match in rows:
+        report = db.get(Report, match.report_id)
+        if not report:
+            continue
+
+        new_ticket = db.get(Ticket, report.ticket_id)
+        candidate = db.get(Ticket, match.candidate_ticket_id)
+
+        if new_ticket.merged_into_id is not None or candidate.merged_into_id is not None:
+            continue
+
+        if new_ticket.id == candidate.id:
+            continue
+
+        result.append({
+            "id": match.id,
+            "score": match.score,
+            "new_ticket": {
+                "id": new_ticket.id,
+                "title": new_ticket.title,
+                "description": new_ticket.description,
+                "room": new_ticket.room.name if new_ticket.room else None,
+                "status": new_ticket.status,
+            },
+            "candidate_ticket": {
+                "id": candidate.id,
+                "title": candidate.title,
+                "description": candidate.description,
+                "room": candidate.room.name if candidate.room else None,
+                "status": candidate.status,
+            },
+        })
+
+    return result
 
 @app.post("/api/admin/duplicates/{match_id}/decision")
-def duplicate_decision(match_id: int, decision: str = Form(...), user: User = Depends(admin_only), db: Session = Depends(get_db)):
-    if decision not in ("linked", "rejected"): raise HTTPException(400, "Ogiltigt beslut")
+def duplicate_decision(
+    match_id: int,
+    decision: str = Form(...),
+    main_ticket_id: int | None = Form(None),
+    user: User = Depends(admin_only),
+    db: Session = Depends(get_db),
+):
+    if decision not in ("linked", "rejected"):
+        raise HTTPException(400, "Ogiltigt beslut")
+
     d = db.get(DuplicateMatch, match_id)
-    if not d: raise HTTPException(404, "Dubblettförslag saknas")
-    d.decision = decision
+    if not d:
+        raise HTTPException(404, "Dubblettförslag saknas")
+
+    report = db.get(Report, d.report_id)
+    if not report:
+        raise HTTPException(404, "Rapporten saknas")
+
+    new_ticket = db.get(Ticket, report.ticket_id)
+    candidate = db.get(Ticket, d.candidate_ticket_id)
+
+    if not new_ticket or not candidate:
+        raise HTTPException(404, "Ett av ärendena saknas")
+
+    if decision == "rejected":
+        d.decision = "rejected"
+        d.decided_by = user.id
+        log(
+            db,
+            candidate.id,
+            "duplicate_rejected",
+            user.username,
+            user.id,
+            f"match_id={d.id}; report_id={d.report_id}",
+        )
+        db.commit()
+        return {"ok": True}
+
+    if main_ticket_id not in (new_ticket.id, candidate.id):
+        raise HTTPException(400, "Ogiltigt huvudärende")
+
+    if new_ticket.id == candidate.id:
+        raise HTTPException(400, "Ärendena är redan samma ärende")
+
+    if new_ticket.merged_into_id is not None or candidate.merged_into_id is not None:
+        raise HTTPException(409, "Ett av ärendena har redan slagits ihop")
+
+    if new_ticket.type != candidate.type or new_ticket.room_id != candidate.room_id:
+        raise HTTPException(400, "Ärendena måste ha samma typ och rum")
+
+    main_ticket = new_ticket if main_ticket_id == new_ticket.id else candidate
+    source_ticket = candidate if main_ticket_id == new_ticket.id else new_ticket
+
+    source_id = source_ticket.id
+    main_id = main_ticket.id
+
+    db.query(Report).filter(
+        Report.ticket_id == source_id
+    ).update(
+        {Report.ticket_id: main_id},
+        synchronize_session=False,
+    )
+
+    db.query(TicketHistory).filter(
+        TicketHistory.ticket_id == source_id
+    ).update(
+        {TicketHistory.ticket_id: main_id},
+        synchronize_session=False,
+    )
+
+    db.query(TicketComment).filter(
+        TicketComment.ticket_id == source_id
+    ).update(
+        {TicketComment.ticket_id: main_id},
+        synchronize_session=False,
+    )
+
+    db.query(Attachment).filter(
+        Attachment.ticket_id == source_id
+    ).update(
+        {Attachment.ticket_id: main_id},
+        synchronize_session=False,
+    )
+
+    db.query(DuplicateMatch).filter(
+        DuplicateMatch.candidate_ticket_id == source_id,
+        DuplicateMatch.decision == "pending",
+    ).update(
+        {DuplicateMatch.candidate_ticket_id: main_id},
+        synchronize_session=False,
+    )
+
+    source_ticket.merged_into_id = main_id
+
+    main_ticket.status = "new"
+    main_ticket.assigned_to = None
+    main_ticket.completed_at = None
+    main_ticket.created_at = datetime.now(timezone.utc)
+
+    d.decision = "linked"
     d.decided_by = user.id
-    log(db, d.candidate_ticket_id, "duplicate_" + decision, user.username, user.id, f"match_id={d.id}; report_id={d.report_id}")
+
+    db.flush()
+
+    pending_matches = db.query(DuplicateMatch).filter(
+        DuplicateMatch.decision == "pending"
+    ).all()
+
+    for match in pending_matches:
+        match_report = db.get(Report, match.report_id)
+        if match_report and match_report.ticket_id == match.candidate_ticket_id:
+            match.decision = "linked"
+            match.decided_by = user.id
+
+    log(
+        db,
+        main_id,
+        "tickets_merged",
+        user.username,
+        user.id,
+        f"source_ticket_id={source_id}; match_id={d.id}",
+    )
+
     db.commit()
-    return {"ok": True}
+
+    return {
+        "ok": True,
+        "main_ticket_id": main_id,
+        "merged_ticket_id": source_id,
+    }
+
+
+@app.get("/api/admin/rooms")
+def list_admin_rooms(user: User = Depends(admin_only), db: Session = Depends(get_db)):
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "qr_token": r.qr_token,
+            "active": r.active
+        }
+        for r in db.query(Room).order_by(Room.name).all()
+    ]
 
 @app.post("/api/admin/rooms")
 def create_room(data: RoomIn, user: User = Depends(admin_only), db: Session = Depends(get_db)):
@@ -420,6 +878,20 @@ def update_user_status(
 
 @app.get("/api/tickets/{ticket_id}/comments")
 def comments(ticket_id: int, user: User = Depends(worker_or_admin), db: Session = Depends(get_db)):
-    rows = db.query(TicketComment).filter_by(ticket_id=ticket_id).order_by(TicketComment.created_at).all()
-    return [{"id": c.id, "username": db.get(User, c.user_id).username, "body": c.body,
-             "created_at": c.created_at.isoformat()} for c in rows]
+    if not db.get(Ticket, ticket_id):
+        raise HTTPException(404, "Ärendet finns inte")
+
+    rows = db.query(TicketComment).filter_by(
+        ticket_id=ticket_id
+    ).order_by(TicketComment.created_at).all()
+
+    return [
+        {
+            "id": c.id,
+            "user_id": c.user_id,
+            "username": db.get(User, c.user_id).username,
+            "body": c.body,
+            "created_at": c.created_at.isoformat()
+        }
+        for c in rows
+    ]

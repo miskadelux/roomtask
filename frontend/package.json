@@ -4,7 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {"dev": "vite --host 0.0.0.0", "build": "tsc -b && vite build"},
-  "dependencies": {"@vitejs/plugin-react": "latest", "vite": "latest", "typescript": "latest", "react": "latest", "react-dom": "latest"},
+  "dependencies": {
+  "@vitejs/plugin-react": "latest",
+  "vite": "latest",
+  "typescript": "latest",
+  "react": "latest",
+  "react-dom": "latest",
+  "qrcode.react": "latest"
+},
   "devDependencies": {
     "@types/react": "latest",
     "@types/react-dom": "latest"
