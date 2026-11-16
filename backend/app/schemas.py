@@ -65,3 +65,7 @@ class UserPasswordIn(BaseModel):
 
 class UserStatusIn(BaseModel):
     active: bool
+
+
+class UserDiscordIn(BaseModel):
+    discord_id: str | None = Field(default=None, min_length=1, max_length=40)

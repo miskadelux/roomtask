@@ -26,6 +26,7 @@ type User = {
   id: number;
   username: string;
   role: "admin" | "worker";
+  discord_id: string | null;
   active: boolean;
 };
 
@@ -458,6 +459,25 @@ async function decideDuplicate(
       setError(e.message);
     }
   }
+
+
+    async function updateUserDiscord(userId: number, discordId: string | null) {
+      setError("");
+      setNotice("");
+
+      try {
+        await api(`/api/admin/users/${userId}/discord`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ discord_id: discordId }),
+        });
+
+        await loadUsers();
+        setNotice("Discord account updated.");
+      } catch (e: any) {
+        setError(e.message);
+      }
+    }
   async function resetUserPassword(userId: number, password: string) {
     setError("");
     setNotice("");
@@ -474,6 +494,10 @@ async function decideDuplicate(
       setError(e.message);
     }
   }
+
+
+
+
   async function updateUserStatus(userId: number, active: boolean) {
     setError("");
     setNotice("");
@@ -718,7 +742,6 @@ function logout() {
             >
               Ändra användare
             </button>
-
             <button
               onClick={() => {
                 const password = window.prompt("Ange nytt lösenord (minst 12 tecken):");
@@ -729,14 +752,27 @@ function logout() {
             </button>
 
             <button
-              onClick={() => updateUserStatus(u.id, !u.active)}
+              onClick={() => {
+                const discordId = window.prompt(
+                  "Enter Discord User ID (leave empty to unlink):",
+                  u.discord_id || ""
+                );
+
+                if (discordId === null) return;
+
+                updateUserDiscord(u.id, discordId.trim() || null);
+              }}
             >
-              {u.active ? "Inaktivera konto" : "Aktivera konto"}
+              {u.discord_id ? "Change Discord account" : "Link Discord account"}
             </button>
+
+            <p className="muted">
+              Discord ID: {u.discord_id || "Not linked"}
+            </p>
           </article>
-        ))}
-      </section>
-    )}
+    ))}
+  </section>
+  )}
 
     {tab === "rooms" && token && role === "admin" && (
   <section className="panel">

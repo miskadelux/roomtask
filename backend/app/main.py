@@ -22,6 +22,7 @@ from .schemas import (
     UserUpdateIn,
     UserPasswordIn,
     UserStatusIn,
+    UserDiscordIn,
 )
 from .security import hash_password, verify_password, create_token, current_user, worker_or_admin, admin_only
 
@@ -97,7 +98,7 @@ def create_report(db, kind, room_id, description, title, source="web", discord_i
         if room_id != t.room_id:
             continue
 
-        score = fuzz.WRatio(normalized, " ".join(t.description.lower().split()))        
+        score = fuzz.WRatio(normalized, " ".join(t.description.lower().split()))
         if score >= 50:
             matches.append((score, t))
 
@@ -153,6 +154,156 @@ def discord_board(x_roomtask_board_key: str | None = Header(default=None), db: S
             } for t in tickets],
         }
     return result
+
+
+
+def discord_bot_user(
+    x_roomtask_bot_key: str | None = Header(default=None, alias="X-RoomTask-Bot-Key"),
+    x_discord_user_id: str | None = Header(default=None, alias="X-Discord-User-ID"),
+    db: Session = Depends(get_db),
+    ) -> User:
+    expected = os.getenv("DISCORD_BOT_API_KEY", "").strip()
+
+    if (
+    not expected
+    or not x_roomtask_bot_key
+    or not secrets.compare_digest(x_roomtask_bot_key, expected)
+    ):
+        raise HTTPException(401, "Unauthorized")
+
+    if not x_discord_user_id or not x_discord_user_id.isdigit():
+        raise HTTPException(401, "Invalid Discord user")
+
+    if not 17 <= len(x_discord_user_id) <= 20:
+        raise HTTPException(401, "Invalid Discord user")
+
+    user = db.query(User).filter_by(discord_id=x_discord_user_id).first()
+
+    if not user or not user.active:
+        raise HTTPException(403, "Discord account is not linked to an active RoomTask user")
+
+    return user
+
+@app.post("/api/internal/discord/tickets/{ticket_id}/claim")
+def discord_claim_ticket(
+    ticket_id: int,
+    user: User = Depends(discord_bot_user),
+    db: Session = Depends(get_db),
+):
+    if user.role != "worker":
+        raise HTTPException(403, "Only workers can claim tasks")
+
+    db.execute(
+        select(User).where(User.id == user.id).with_for_update()
+    ).scalar_one()
+
+    active = db.query(Ticket).filter(
+        Ticket.assigned_to == user.id,
+        Ticket.status == "in_progress"
+    ).first()
+
+    if active:
+        raise HTTPException(409, f"You already have an active task (#{active.id})")
+
+    ticket = db.execute(
+        select(Ticket).where(Ticket.id == ticket_id).with_for_update()
+    ).scalar_one_or_none()
+
+    if not ticket or ticket.merged_into_id is not None:
+        raise HTTPException(404, "Ticket not found")
+
+    if ticket.status != "new" or ticket.assigned_to is not None:
+        raise HTTPException(409, "Ticket is no longer available")
+
+    ticket.assigned_to = user.id
+    ticket.status = "in_progress"
+
+    log(db, ticket.id, "claimed", user.username, user.id)
+    db.commit()
+
+    return {"ok": True, "ticket_id": ticket.id}
+
+
+@app.post("/api/internal/discord/tickets/{ticket_id}/complete")
+def discord_complete_ticket(
+    ticket_id: int,
+    data: CompleteTicketIn,
+    user: User = Depends(discord_bot_user),
+    db: Session = Depends(get_db),
+):
+    description = data.completion_description.strip()
+
+    if not description:
+        raise HTTPException(400, "Completion description is required")
+
+    ticket = db.get(Ticket, ticket_id)
+
+    if not ticket or ticket.merged_into_id is not None:
+        raise HTTPException(404, "Ticket not found")
+
+    if ticket.status != "in_progress":
+        raise HTTPException(409, "Ticket is not in progress")
+
+    if user.role != "admin" and ticket.assigned_to != user.id:
+        raise HTTPException(403, "You can only complete your own task")
+
+    ticket.status = "done"
+    ticket.completed_at = datetime.now(timezone.utc)
+
+    log(
+        db,
+        ticket.id,
+        "completed",
+        user.username,
+        user.id,
+        details=f"Work completed: {description}"
+    )
+
+    db.commit()
+
+    return {"ok": True, "ticket_id": ticket.id}
+
+
+@app.get("/api/internal/discord/tickets/{ticket_id}")
+def discord_ticket_details(
+    ticket_id: int,
+    user: User = Depends(discord_bot_user),
+    db: Session = Depends(get_db),
+):
+    ticket = db.get(Ticket, ticket_id)
+
+    if not ticket or ticket.merged_into_id is not None:
+        raise HTTPException(404, "Ticket not found")
+
+    comments = db.query(TicketComment).filter_by(
+        ticket_id=ticket_id
+    ).order_by(TicketComment.created_at.desc()).limit(10).all()
+
+    history = db.query(TicketHistory).filter_by(
+        ticket_id=ticket_id
+    ).order_by(TicketHistory.created_at.desc()).limit(10).all()
+
+    return {
+        "ticket": ticket_to_out(ticket, db).model_dump(),
+        "comments": [
+            {
+                "username": db.get(User, c.user_id).username,
+                "body": c.body,
+                "created_at": c.created_at.isoformat(),
+            }
+            for c in comments
+        ],
+        "history": [
+            {
+                "actor": h.actor_label,
+                "action": h.action,
+                "details": h.details,
+                "created_at": h.created_at.isoformat(),
+            }
+            for h in history
+        ],
+    }
+
 
 @app.post("/api/auth/login")
 def login(data: LoginIn, db: Session = Depends(get_db)):
@@ -766,6 +917,7 @@ def list_users(user: User = Depends(admin_only), db: Session = Depends(get_db)):
             "username": u.username,
             "role": u.role,
             "active": u.active,
+            "discord_id": u.discord_id,
             "created_at": u.created_at.isoformat(),
         }
         for u in users
@@ -875,6 +1027,36 @@ def update_user_status(
 
     return {"ok": True, "active": target.active}
 
+
+@app.put("/api/admin/users/{user_id}/discord")
+def update_user_discord(
+    user_id: int,
+    data: UserDiscordIn,
+    user: User = Depends(admin_only),
+    db: Session = Depends(get_db),
+):
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "User not found")
+
+    discord_id = data.discord_id.strip() if data.discord_id else None
+
+    if discord_id:
+        if not discord_id.isdigit() or not 17 <= len(discord_id) <= 20:
+            raise HTTPException(400, "Invalid Discord ID")
+
+        existing = db.query(User).filter(
+            User.discord_id == discord_id,
+            User.id != user_id,
+        ).first()
+
+        if existing:
+            raise HTTPException(409, "Discord account is already linked")
+
+    target.discord_id = discord_id
+    db.commit()
+
+    return {"ok": True, "discord_id": target.discord_id}
 
 @app.get("/api/tickets/{ticket_id}/comments")
 def comments(ticket_id: int, user: User = Depends(worker_or_admin), db: Session = Depends(get_db)):
