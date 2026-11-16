@@ -98,7 +98,7 @@ def create_report(db, kind, room_id, description, title, source="web", discord_i
         if room_id != t.room_id:
             continue
 
-        score = fuzz.WRatio(normalized, " ".join(t.description.lower().split()))
+        score = fuzz.WRatio(normalized, " ".join(t.description.lower().split()))        
         if score >= 50:
             matches.append((score, t))
 
@@ -156,7 +156,7 @@ def discord_board(x_roomtask_board_key: str | None = Header(default=None), db: S
     return result
 
 
-
+        
 def discord_bot_user(
     x_roomtask_bot_key: str | None = Header(default=None, alias="X-RoomTask-Bot-Key"),
     x_discord_user_id: str | None = Header(default=None, alias="X-Discord-User-ID"),
@@ -302,6 +302,48 @@ def discord_ticket_details(
             }
             for h in history
         ],
+    }
+
+
+@app.post("/api/internal/discord/tickets/{ticket_id}/comments")
+def discord_add_comment(
+    ticket_id: int,
+    data: CommentIn,
+    user: User = Depends(discord_bot_user),
+    db: Session = Depends(get_db),
+):
+    ticket = db.get(Ticket, ticket_id)
+
+    if not ticket or ticket.merged_into_id is not None:
+        raise HTTPException(404, "Ticket not found")
+
+    body = data.body.strip()
+
+    if not body:
+        raise HTTPException(400, "Comment cannot be empty")
+
+    comment = TicketComment(
+        ticket_id=ticket.id,
+        user_id=user.id,
+        body=body
+    )
+
+    db.add(comment)
+
+    log(
+        db,
+        ticket.id,
+        "comment_added",
+        user.username,
+        user.id
+    )
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "ticket_id": ticket.id,
+        "comment_id": comment.id
     }
 
 
