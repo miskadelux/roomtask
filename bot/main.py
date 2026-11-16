@@ -43,6 +43,27 @@ async def internal_request(method: str, path: str, interaction: discord.Interact
     return response.json() if response.content else {}
 BOARD_MARKER = "roomtask-board-v1"
 
+REPORT_SESSION_TIMEOUT = 600
+report_sessions = {}
+
+
+def get_report_session(user_id: int):
+    session = report_sessions.get(user_id)
+    if session is None:
+        return None
+
+    import time
+    if time.monotonic() - session["created_at"] > REPORT_SESSION_TIMEOUT:
+        report_sessions.pop(user_id, None)
+        return None
+
+    return session
+
+
+def clear_report_session(user_id: int):
+    report_sessions.pop(user_id, None)
+
+
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -50,21 +71,23 @@ tree = app_commands.CommandTree(client)
 
 
 class ReportModal(discord.ui.Modal):
-    def __init__(self, kind: str, language: str, rooms: list):
+    def __init__(self, kind: str, language: str, rooms: list, user_id: int):
         self.kind = kind
         self.language = language
+        self.user_id = user_id
         self.rooms_by_id = {
             str(room["id"]): room for room in rooms
         }
 
         if language == "sv":
-            modal_title = "Ny felanmälan" if kind == "fault" else "Nytt önskemål"
+            modal_title = "Ny felanm?lan" if kind == "fault" else "Nytt ?nskem?l"
             room_label = "Rum"
-            room_placeholder = "Välj ett rum..."
+            room_placeholder = "V?lj ett rum..."
             title_label = "Rubrik"
             title_placeholder = "Kort sammanfattning"
             description_label = "Beskrivning"
-            description_placeholder = "Beskriv felet eller önskemålet..."
+            description_placeholder = "Beskriv felet eller ?nskem?let..."
+            submit_label = "Forts?tt"
         else:
             modal_title = "New fault report" if kind == "fault" else "New request"
             room_label = "Room"
@@ -73,6 +96,7 @@ class ReportModal(discord.ui.Modal):
             title_placeholder = "Short summary"
             description_label = "Description"
             description_placeholder = "Describe the fault or request..."
+            submit_label = "Continue"
 
         super().__init__(title=modal_title)
 
@@ -114,75 +138,205 @@ class ReportModal(discord.ui.Modal):
         self.add_item(self.description)
 
     async def on_submit(self, interaction: discord.Interaction):
+        session = get_report_session(self.user_id)
+
+        if (
+            interaction.user.id != self.user_id
+            or not session
+            or session.get("step") != "form"
+        ):
+            await interaction.response.send_message(
+                "This report session has expired. Please start again.",
+                ephemeral=True,
+            )
+            return
+
+        room_id = self.room_select.values[0]
+        selected_room = self.rooms_by_id.get(room_id)
+
+        if selected_room is None:
+            await interaction.response.send_message(
+                "Room not found. Please start again.",
+                ephemeral=True,
+            )
+            return
+
+        data = {
+            "kind": self.kind,
+            "room_id": room_id,
+            "title": str(self.title_field),
+            "description": str(self.description),
+            "room_name": selected_room["name"],
+        }
+
+        session["data"] = data
+        session["step"] = "review"
+
+        if self.language == "sv":
+            message = (
+                "**Kontrollera ditt ?rende:**\n"
+                f"**Typ:** {'Felanm?lan' if self.kind == 'fault' else '?nskem?l'}\n"
+                f"**Rum:** {data['room_name']}\n"
+                f"**Rubrik:** {data['title']}\n"
+                f"**Beskrivning:**\n{data['description']}"
+            )
+        else:
+            message = (
+                "**Review your report:**\n"
+                f"**Type:** {'Fault report' if self.kind == 'fault' else 'Request'}\n"
+                f"**Room:** {data['room_name']}\n"
+                f"**Title:** {data['title']}\n"
+                f"**Description:**\n{data['description']}"
+            )
+
+        await interaction.response.send_message(
+            message,
+            view=ReportReviewView(self.user_id, self.language),
+            ephemeral=True,
+        )
+
+
+class ReportReviewView(discord.ui.View):
+    def __init__(self, user_id: int, language: str):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.language = language
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        session = get_report_session(self.user_id)
+
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This report session belongs to another user.",
+                ephemeral=True,
+            )
+            return False
+
+        if not session or session.get("step") != "review":
+            await interaction.response.send_message(
+                "This report session has expired or moved to another step.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(
+        label="Submit report",
+        style=discord.ButtonStyle.success,
+    )
+    async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = get_report_session(self.user_id)
+
+        if not session or not session.get("data"):
+            await interaction.response.send_message(
+                "Report data could not be found. Please start again.",
+                ephemeral=True,
+            )
+            return
+
+        session["step"] = "submitting"
+        data = session["data"]
+
+        await interaction.response.defer(ephemeral=True)
+
         try:
-            room_id = self.room_select.values[0]
-            selected_room = self.rooms_by_id.get(room_id)
-
-            if selected_room is None:
-                await interaction.response.send_message(
-                    "Room not found. Please try again.",
-                    ephemeral=True,
-                )
-                return
-
-            data = {
-                "kind": self.kind,
-                "room_id": room_id,
-                "title": str(self.title_field),
-                "description": str(self.description),
-            }
-
             async with httpx.AsyncClient(timeout=15) as http:
                 response = await http.post(
                     f"{API}/api/public/reports",
-                    data=data,
+                    data={
+                        "kind": data["kind"],
+                        "room_id": data["room_id"],
+                        "title": data["title"],
+                        "description": data["description"],
+                    },
                 )
                 response.raise_for_status()
                 result = response.json()
 
+            clear_report_session(self.user_id)
+
             if self.language == "sv":
-                message = f"Tack! Ärende **#{result['ticket_id']}** har registrerats."
+                message = f"Tack! ?rende **#{result['ticket_id']}** har registrerats."
             else:
                 message = f"Thank you! Ticket **#{result['ticket_id']}** has been submitted."
 
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.followup.send(message, ephemeral=True)
 
             if LOG_CHANNEL_ID:
-                channel = client.get_channel(LOG_CHANNEL_ID)
+                try:
+                    channel = client.get_channel(LOG_CHANNEL_ID)
 
-                if channel:
-                    ticket = {
-                        "id": result["ticket_id"],
-                        "type": self.kind,
-                        "title": str(self.title_field),
-                        "description": str(self.description),
-                        "room": selected_room["name"],
-                        "status": "new",
-                        "assigned_to": None,
-                    }
+                    if channel:
+                        ticket = {
+                            "id": result["ticket_id"],
+                            "type": data["kind"],
+                            "title": data["title"],
+                            "description": data["description"],
+                            "room": data["room_name"],
+                            "status": "new",
+                            "assigned_to": None,
+                        }
 
-                    await channel.send(
-                        embed=build_ticket_embed(ticket),
-                        view=build_ticket_action_view(
-                            ticket["id"],
-                            ticket["status"],
-                        ),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
+                        await channel.send(
+                            embed=build_ticket_embed(ticket),
+                            view=build_ticket_action_view(
+                                ticket["id"],
+                                ticket["status"],
+                            ),
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                except Exception as exc:
+                    print(f"Report log notification failed: {exc}")
 
-            await refresh_board()
+            try:
+                await refresh_board()
+            except Exception as exc:
+                print(f"Board refresh after report failed: {exc}")
 
         except Exception as exc:
             print(f"Report submission failed: {exc}")
+            session["step"] = "review"
+
             message = (
-                "Kunde inte registrera ärendet. Försök igen senare."
+                "Kunde inte registrera ?rendet. F?rs?k igen."
                 if self.language == "sv"
-                else "Could not submit the report. Please try again later."
+                else "Could not submit the report. Please try again."
             )
-            if not interaction.response.is_done():
-                await interaction.response.send_message(message, ephemeral=True)
-            else:
-                await interaction.followup.send(message, ephemeral=True)
+
+            await interaction.followup.send(message, ephemeral=True)
+
+    @discord.ui.button(
+        label="Back",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = get_report_session(self.user_id)
+        session["step"] = "type"
+        session.pop("data", None)
+
+        message = (
+            "Vad vill du skicka in?"
+            if self.language == "sv"
+            else "What would you like to submit?"
+        )
+
+        await interaction.response.edit_message(
+            content=message,
+            view=ReportTypeView(self.user_id, self.language),
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.danger,
+    )
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clear_report_session(self.user_id)
+
+        await interaction.response.edit_message(
+            content="Report cancelled. You can start a new report whenever you want.",
+            view=None,
+        )
 
 
 def build_ticket_embed(ticket: dict) -> discord.Embed:
@@ -402,105 +556,78 @@ class TicketActionButton(
             )
 
 
-class RoomSelect(discord.ui.Select):
-    def __init__(self, rooms: list, kind: str, language: str):
-        self.kind = kind
-        self.language = language
+class ReportLanguageView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=600)
+        self.user_id = user_id
 
-        options = [
-            discord.SelectOption(
-                label=room["name"][:100],
-                value=str(room["id"]),
-            )
-            for room in rooms[:25]
-        ]
+    async def interaction_check(self, interaction: discord.Interaction):
+        session = get_report_session(interaction.user.id)
 
-        placeholder = (
-            "Välj rum / plats..."
-            if language == "sv"
-            else "Select room / location..."
-        )
-
-        super().__init__(
-            placeholder=placeholder,
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        room_id = int(self.values[0])
-        selected_room = next(
-            (room for room in self.view.rooms if int(room["id"]) == room_id),
-            None,
-        )
-
-        if selected_room is None:
+        if interaction.user.id != self.user_id:
             await interaction.response.send_message(
-                "Room not found. Please try again.",
+                "This report session belongs to another user.",
                 ephemeral=True,
             )
-            return
+            return False
 
-        await interaction.response.send_modal(
-            ReportModal(
-                self.kind,
-                self.language,
-                room_id,
-                selected_room["name"],
+        if not session or session.get("step") != "language":
+            await interaction.response.send_message(
+                "This report session has expired or moved to another step.",
+                ephemeral=True,
             )
-        )
+            return False
 
+        return True
 
-class RoomSelectView(discord.ui.View):
-    def __init__(self, rooms: list, kind: str, language: str):
-        super().__init__(timeout=180)
-        self.rooms = rooms
-        self.add_item(RoomSelect(rooms, kind, language))
-
-class ReportLanguageView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="🇬🇧 English",
-        style=discord.ButtonStyle.primary,
-        custom_id="roomtask:report:english",
-    )
+    @discord.ui.button(label="English", style=discord.ButtonStyle.primary)
     async def english(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = get_report_session(self.user_id)
+        session["language"] = "en"
+        session["step"] = "type"
+
         await interaction.response.send_message(
             "What would you like to submit?",
-            view=ReportTypeView("en"),
+            view=ReportTypeView(self.user_id, "en"),
             ephemeral=True,
         )
 
-    @discord.ui.button(
-        label="🇸🇪 Svenska",
-        style=discord.ButtonStyle.primary,
-        custom_id="roomtask:report:swedish",
-    )
+    @discord.ui.button(label="Svenska", style=discord.ButtonStyle.primary)
     async def swedish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = get_report_session(self.user_id)
+        session["language"] = "sv"
+        session["step"] = "type"
+
         await interaction.response.send_message(
             "Vad vill du skicka in?",
-            view=ReportTypeView("sv"),
+            view=ReportTypeView(self.user_id, "sv"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clear_report_session(self.user_id)
+        await interaction.response.send_message(
+            "Report cancelled. You can start a new report whenever you want.",
             ephemeral=True,
         )
 
 
 class ReportTypeView(discord.ui.View):
-    def __init__(self, language: str):
-        super().__init__(timeout=180)
+    def __init__(self, user_id: int, language: str):
+        super().__init__(timeout=600)
+        self.user_id = user_id
         self.language = language
 
         if language == "sv":
             options = [
-                (" Felanmälan", "fault", discord.ButtonStyle.danger),
-                (" Önskemål", "request", discord.ButtonStyle.success),
+                ("Felanmälan", "fault", discord.ButtonStyle.danger),
+                ("önskemål", "request", discord.ButtonStyle.success),
             ]
         else:
             options = [
-                (" Report a fault", "fault", discord.ButtonStyle.danger),
-                (" Submit a request", "request", discord.ButtonStyle.success),
+                ("Report a fault", "fault", discord.ButtonStyle.danger),
+                ("Submit a request", "request", discord.ButtonStyle.success),
             ]
 
         for label, kind, style in options:
@@ -508,6 +635,24 @@ class ReportTypeView(discord.ui.View):
 
             async def callback(interaction: discord.Interaction, report_kind=kind):
                 try:
+                    session = get_report_session(self.user_id)
+
+                    if interaction.user.id != self.user_id:
+                        await interaction.response.send_message(
+                            "This report session belongs to another user.",
+                            ephemeral=True,
+                        )
+                        return
+
+                    if not session or session.get("step") != "type":
+                        await interaction.response.send_message(
+                            "This report session has expired or moved to another step.",
+                            ephemeral=True,
+                        )
+                        return
+
+                    session["kind"] = report_kind
+
                     async with httpx.AsyncClient(timeout=15) as http:
                         response = await http.get(f"{API}/api/rooms")
                         response.raise_for_status()
@@ -525,14 +670,16 @@ class ReportTypeView(discord.ui.View):
                         )
                         return
 
+                    session["step"] = "form"
+
                     await interaction.response.send_modal(
-                        ReportModal(report_kind, self.language, rooms)
+                        ReportModal(report_kind, self.language, rooms, self.user_id)
                     )
 
                 except Exception as exc:
                     print(f"Room selection failed: {exc}")
                     message = (
-                        "Kunde inte hämta rummen. Försök igen senare."
+                        "Kunde inte h?mta rummen. F?rs?k igen senare."
                         if self.language == "sv"
                         else "Could not load rooms. Please try again later."
                     )
@@ -544,6 +691,44 @@ class ReportTypeView(discord.ui.View):
             button.callback = callback
             self.add_item(button)
 
+    async def interaction_check(self, interaction: discord.Interaction):
+        session = get_report_session(interaction.user.id)
+
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This report session belongs to another user.",
+                ephemeral=True,
+            )
+            return False
+
+        if not session or session.get("step") != "type":
+            await interaction.response.send_message(
+                "This report session has expired or moved to another step.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = get_report_session(self.user_id)
+        session["step"] = "language"
+
+        await interaction.response.send_message(
+            "Choose your language / V?lj spr?k:",
+            view=ReportLanguageView(self.user_id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clear_report_session(self.user_id)
+
+        await interaction.response.send_message(
+            "Report cancelled. You can start a new report whenever you want.",
+            ephemeral=True,
+        )
 
 
 class ReportPanelView(discord.ui.View):
@@ -551,7 +736,7 @@ class ReportPanelView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Submit a report / Skicka in ett ärende",
+        label="Submit a report / Skicka in ett ?rende",
         style=discord.ButtonStyle.primary,
         custom_id="roomtask:report:open",
     )
@@ -560,11 +745,29 @@ class ReportPanelView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
+        import time
+
+        user_id = interaction.user.id
+        session = get_report_session(user_id)
+
+        if session:
+            await interaction.response.send_message(
+                "You already have an active report session. Continue using its existing message or cancel it first.",
+                ephemeral=True,
+            )
+            return
+
+        report_sessions[user_id] = {
+            "created_at": time.monotonic(),
+            "step": "language",
+        }
+
         await interaction.response.send_message(
-            "Choose your language / Välj språk:",
-            view=ReportLanguageView(),
+            "Choose your language / V?lj spr?k:",
+            view=ReportLanguageView(user_id),
             ephemeral=True,
         )
+
 
 REPORT_PANEL_MARKER = "roomtask-report-panel"
 
@@ -711,12 +914,28 @@ async def comment(interaction: discord.Interaction, ticket_id: int):
 
 @tree.command(name="report", description="Submit a fault report or request")
 async def report(interaction: discord.Interaction):
+    import time
+
+    user_id = interaction.user.id
+    session = get_report_session(user_id)
+
+    if session:
+        await interaction.response.send_message(
+            "You already have an active report session. Continue using its existing message or cancel it first.",
+            ephemeral=True,
+        )
+        return
+
+    report_sessions[user_id] = {
+        "created_at": time.monotonic(),
+        "step": "language",
+    }
+
     await interaction.response.send_message(
-        "Choose your language / Välj språk:",
-        view=ReportLanguageView(),
+        "Choose your language / V?lj spr?k:",
+        view=ReportLanguageView(user_id),
         ephemeral=True,
     )
-
 
 def build_board_embed(payload: dict) -> discord.Embed:
     columns = payload.get("columns", {})
