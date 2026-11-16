@@ -346,6 +346,42 @@ def discord_add_comment(
         "comment_id": comment.id
     }
 
+@app.post("/api/internal/discord/tickets/{ticket_id}/reopen")
+def discord_reopen_ticket(
+    ticket_id: int,
+    user: User = Depends(discord_bot_user),
+    db: Session = Depends(get_db),
+):
+    if user.role != "admin":
+        raise HTTPException(403, "Only administrators can reopen tasks")
+
+    ticket = db.get(Ticket, ticket_id)
+
+    if not ticket or ticket.merged_into_id is not None:
+        raise HTTPException(404, "Ticket not found")
+
+    if ticket.status != "done":
+        raise HTTPException(409, "Task is not completed")
+
+    ticket.status = "in_progress"
+    ticket.completed_at = None
+
+    log(
+        db,
+        ticket.id,
+        "reopened_after_admin_discussion",
+        user.username,
+        user.id,
+        details="Task reopened by an administrator through Discord."
+    )
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "ticket_id": ticket.id,
+    }
+
 
 @app.post("/api/auth/login")
 def login(data: LoginIn, db: Session = Depends(get_db)):
