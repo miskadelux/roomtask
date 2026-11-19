@@ -418,6 +418,7 @@ async def move_ticket_card(
     destination_channel_id: int,
     interaction: discord.Interaction,
     thread_update: str | None = None,
+    history: list | None = None,
 ):
     if not destination_channel_id:
         raise RuntimeError("Destination Discord channel is not configured")
@@ -425,7 +426,7 @@ async def move_ticket_card(
     destination = await client.fetch_channel(destination_channel_id)
 
     new_message = await destination.send(
-        embed=build_ticket_embed(ticket),
+        embed=build_ticket_embed(ticket, history),
         view=build_ticket_action_view(ticket["id"], ticket["status"]),
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -473,18 +474,43 @@ async def move_ticket_card(
 
     return new_message
 
-
-def build_ticket_embed(ticket: dict) -> discord.Embed:
+def build_ticket_embed(ticket: dict, history: list | None = None) -> discord.Embed:
     status_labels = {
         "new": "New",
         "in_progress": "In progress",
         "done": "Completed",
     }
 
+    original_description = ticket.get("description") or "No description provided."
+
+    description = f"**Original report**\n{original_description}"
+
+    completed_entry = next(
+        (
+            item for item in (history or [])
+            if item.get("action") == "completed"
+        ),
+        None,
+    )
+
+    if ticket.get("status") == "done" and completed_entry:
+        work_description = completed_entry.get("details") or ""
+        work_description = work_description.removeprefix("Work completed: ")
+
+        description += (
+            f"\n\n**Work completed**\n{work_description}"
+            f"\n\n**Completed by:** {completed_entry.get('actor') or 'Unknown'}"
+            f"\n**Completed at:** {completed_entry.get('created_at') or 'Unknown'}"
+        )
+
     embed = discord.Embed(
         title=f"Report #{ticket['id']}: {ticket['title']}",
-        description=ticket.get("description") or "No description provided.",
-        color=discord.Color.blue(),
+        description=description[:4096],
+        color=(
+            discord.Color.green()
+            if ticket.get("status") == "done"
+            else discord.Color.blue()
+        ),
     )
 
     embed.add_field(
@@ -509,6 +535,7 @@ def build_ticket_embed(ticket: dict) -> discord.Embed:
     )
 
     return embed
+
 
 
 def build_ticket_action_view(ticket_id: int, status: str):
@@ -576,7 +603,8 @@ class CompleteTicketModal(discord.ui.Modal):
                     f"**Report #{self.ticket_id} completed** by "
                     f"{interaction.user.mention}.\\n"
                     f"**Work description:** {completion_description}"
-                ),
+                    ),
+                history=result.get("history", []),
             )
 
             await interaction.followup.send(
