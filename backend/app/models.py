@@ -36,6 +36,13 @@ class Ticket(Base):
     assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    discord_channel_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    discord_message_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    discord_thread_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    discord_report_channel_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    discord_report_message_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
     room = relationship("Room")
     assignee = relationship("User", foreign_keys=[assigned_to])
     reports = relationship("Report", back_populates="ticket")

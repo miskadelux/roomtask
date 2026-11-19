@@ -23,6 +23,7 @@ from .schemas import (
     UserPasswordIn,
     UserStatusIn,
     UserDiscordIn,
+    DiscordMetadataIn,
 )
 from .security import hash_password, verify_password, create_token, current_user, worker_or_admin, admin_only
 
@@ -52,10 +53,32 @@ def migrate_ticket_merge():
                 "FOREIGN KEY (merged_into_id) REFERENCES tickets(id)"
             ))
 
+def migrate_ticket_discord():
+    inspector = inspect(engine)
+    columns = {column["name"] for column in inspector.get_columns("tickets")}
+
+    discord_columns = [
+        "discord_channel_id",
+        "discord_message_id",
+        "discord_thread_id",
+        "discord_report_channel_id",
+        "discord_report_message_id",
+    ]
+
+    with engine.begin() as conn:
+        for column in discord_columns:
+            if column not in columns:
+                conn.execute(text(
+                    f"ALTER TABLE tickets ADD COLUMN {column} VARCHAR(32) NULL"
+                ))
+                print(f"Database migration: added tickets.{column}")
+
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
     migrate_ticket_merge()
+    migrate_ticket_discord()
     with SessionLocal() as db:
         if not db.query(User).filter_by(role="admin").first():
             username = os.getenv("ADMIN_USERNAME", "admin")
@@ -285,6 +308,13 @@ def discord_ticket_details(
 
     return {
         "ticket": ticket_to_out(ticket, db).model_dump(),
+        "discord": {
+            "channel_id": ticket.discord_channel_id,
+            "message_id": ticket.discord_message_id,
+            "thread_id": ticket.discord_thread_id,
+            "report_channel_id": ticket.discord_report_channel_id,
+            "report_message_id": ticket.discord_report_message_id,
+        },
         "comments": [
             {
                 "username": db.get(User, c.user_id).username,
@@ -303,6 +333,37 @@ def discord_ticket_details(
             for h in history
         ],
     }
+
+
+@app.patch("/api/internal/discord/tickets/{ticket_id}/metadata")
+def discord_update_ticket_metadata(
+    ticket_id: int,
+    data: DiscordMetadataIn,
+    x_roomtask_bot_key: str | None = Header(default=None, alias="X-RoomTask-Bot-Key"),
+    db: Session = Depends(get_db),
+):
+    expected = os.getenv("DISCORD_BOT_API_KEY", "").strip()
+
+    if (
+        not expected
+        or not x_roomtask_bot_key
+        or not secrets.compare_digest(x_roomtask_bot_key, expected)
+    ):
+        raise HTTPException(401, "Unauthorized")
+
+    ticket = db.get(Ticket, ticket_id)
+
+    if not ticket or ticket.merged_into_id is not None:
+        raise HTTPException(404, "Ticket not found")
+
+    updates = data.model_dump(exclude_unset=True)
+
+    for field, value in updates.items():
+        setattr(ticket, field, value)
+
+    db.commit()
+
+    return {"ok": True, "ticket_id": ticket.id}
 
 
 @app.post("/api/internal/discord/tickets/{ticket_id}/comments")

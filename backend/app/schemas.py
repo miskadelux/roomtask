@@ -69,3 +69,11 @@ class UserStatusIn(BaseModel):
 
 class UserDiscordIn(BaseModel):
     discord_id: str | None = Field(default=None, min_length=1, max_length=40)
+
+class DiscordMetadataIn(BaseModel):
+    discord_channel_id: str | None = Field(default=None, max_length=32)
+    discord_message_id: str | None = Field(default=None, max_length=32)
+    discord_thread_id: str | None = Field(default=None, max_length=32)
+    discord_report_channel_id: str | None = Field(default=None, max_length=32)
+    discord_report_message_id: str | None = Field(default=None, max_length=32)
+

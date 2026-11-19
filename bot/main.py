@@ -9,6 +9,10 @@ GUILD_ID = os.getenv("DISCORD_GUILD_ID", "")
 LOG_CHANNEL_ID = int(os.getenv("DISCORD_LOG_CHANNEL_ID", "0") or 0)
 BOARD_CHANNEL_ID = int(os.getenv("DISCORD_BOARD_CHANNEL_ID", "0") or 0)
 REPORT_CHANNEL_ID = int(os.getenv("DISCORD_REPORT_CHANNEL_ID", "0") or 0)
+NEW_REPORTS_CHANNEL_ID = int(os.getenv("DISCORD_NEW_REPORTS_CHANNEL_ID", "0") or 0)
+ACTIVE_TASKS_CHANNEL_ID = int(os.getenv("DISCORD_ACTIVE_TASKS_CHANNEL_ID", "0") or 0)
+COMPLETED_TASKS_CHANNEL_ID = int(os.getenv("DISCORD_COMPLETED_TASKS_CHANNEL_ID", "0") or 0)
+TASK_DISCUSSION_CHANNEL_ID = int(os.getenv("DISCORD_TASK_DISCUSSION_CHANNEL_ID", "0") or 0)
 BOARD_API_KEY = os.getenv("DISCORD_BOARD_API_KEY", "")
 BOT_API_KEY = os.getenv("DISCORD_BOT_API_KEY", "")
 BOARD_REFRESH_SECONDS = max(30, int(os.getenv("DISCORD_BOARD_REFRESH_SECONDS", "60")))
@@ -41,6 +45,20 @@ async def internal_request(method: str, path: str, interaction: discord.Interact
         raise RuntimeError(str(detail))
 
     return response.json() if response.content else {}
+
+async def save_ticket_metadata(ticket_id: int, **metadata):
+    if not BOT_API_KEY:
+        raise RuntimeError("DISCORD_BOT_API_KEY is not configured")
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        response = await http.patch(
+            f"{API}/api/internal/discord/tickets/{ticket_id}/metadata",
+            headers={"X-RoomTask-Bot-Key": BOT_API_KEY},
+            json=metadata,
+        )
+        response.raise_for_status()
+        return response.json()
+
 BOARD_MARKER = "roomtask-board-v1"
 
 REPORT_SESSION_TIMEOUT = 600
@@ -71,23 +89,31 @@ tree = app_commands.CommandTree(client)
 
 
 class ReportModal(discord.ui.Modal):
-    def __init__(self, kind: str, language: str, rooms: list, user_id: int):
+    def __init__(
+        self,
+        kind: str,
+        language: str,
+        rooms: list,
+        user_id: int,
+        previous_data: dict | None = None,
+    ):
         self.kind = kind
         self.language = language
         self.user_id = user_id
+        previous_data = previous_data or {}
         self.rooms_by_id = {
             str(room["id"]): room for room in rooms
         }
 
         if language == "sv":
-            modal_title = "Ny felanm?lan" if kind == "fault" else "Nytt ?nskem?l"
+            modal_title = "Ny felanmälan" if kind == "fault" else "Nytt önskemml"
             room_label = "Rum"
-            room_placeholder = "V?lj ett rum..."
+            room_placeholder = "Välj ett rum..."
             title_label = "Rubrik"
             title_placeholder = "Kort sammanfattning"
             description_label = "Beskrivning"
-            description_placeholder = "Beskriv felet eller ?nskem?let..."
-            submit_label = "Forts?tt"
+            description_placeholder = "Beskriv felet eller önskemålet..."
+            submit_label = "Fortsätt"
         else:
             modal_title = "New fault report" if kind == "fault" else "New request"
             room_label = "Room"
@@ -104,6 +130,7 @@ class ReportModal(discord.ui.Modal):
             discord.SelectOption(
                 label=room["name"][:100],
                 value=str(room["id"]),
+                default=str(room["id"]) == str(previous_data.get("room_id", "")),
             )
             for room in rooms[:25]
         ]
@@ -118,12 +145,14 @@ class ReportModal(discord.ui.Modal):
         self.title_field = discord.ui.TextInput(
             label=title_label,
             placeholder=title_placeholder,
+            default=previous_data.get("title", ""),
             max_length=180,
         )
 
         self.description = discord.ui.TextInput(
             label=description_label,
             placeholder=description_placeholder,
+            default=previous_data.get("description", ""),
             style=discord.TextStyle.paragraph,
             max_length=3000,
         )
@@ -174,8 +203,8 @@ class ReportModal(discord.ui.Modal):
 
         if self.language == "sv":
             message = (
-                "**Kontrollera ditt ?rende:**\n"
-                f"**Typ:** {'Felanm?lan' if self.kind == 'fault' else '?nskem?l'}\n"
+                "**Kontrollera ditt ärende:**\n"
+                f"**Typ:** {'Felanmälan' if self.kind == 'fault' else 'önskemål'}\n"
                 f"**Rum:** {data['room_name']}\n"
                 f"**Rubrik:** {data['title']}\n"
                 f"**Beskrivning:**\n{data['description']}"
@@ -257,37 +286,47 @@ class ReportReviewView(discord.ui.View):
             clear_report_session(self.user_id)
 
             if self.language == "sv":
-                message = f"Tack! ?rende **#{result['ticket_id']}** har registrerats."
+                message = f"Tack! ärende **#{result['ticket_id']}** har registrerats."
             else:
                 message = f"Thank you! Ticket **#{result['ticket_id']}** has been submitted."
 
             await interaction.followup.send(message, ephemeral=True)
 
-            if LOG_CHANNEL_ID:
+            if NEW_REPORTS_CHANNEL_ID:
                 try:
-                    channel = client.get_channel(LOG_CHANNEL_ID)
+                    channel = await client.fetch_channel(NEW_REPORTS_CHANNEL_ID)
 
-                    if channel:
-                        ticket = {
-                            "id": result["ticket_id"],
-                            "type": data["kind"],
-                            "title": data["title"],
-                            "description": data["description"],
-                            "room": data["room_name"],
-                            "status": "new",
-                            "assigned_to": None,
-                        }
+                    ticket = {
+                        "id": result["ticket_id"],
+                        "type": data["kind"],
+                        "title": data["title"],
+                        "description": data["description"],
+                        "room": data["room_name"],
+                        "status": "new",
+                        "assigned_to": None,
+                    }
 
-                        await channel.send(
-                            embed=build_ticket_embed(ticket),
-                            view=build_ticket_action_view(
-                                ticket["id"],
-                                ticket["status"],
-                            ),
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
+                    report_message = await channel.send(
+                        embed=build_ticket_embed(ticket),
+                        view=build_ticket_action_view(
+                            ticket["id"],
+                            ticket["status"],
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+
+                    await save_ticket_metadata(
+                        ticket["id"],
+                        discord_channel_id=str(channel.id),
+                        discord_message_id=str(report_message.id),
+                        discord_report_channel_id=str(channel.id),
+                        discord_report_message_id=str(report_message.id),
+                    )
+
+                    await create_ticket_discussion(ticket, report_message)
+
                 except Exception as exc:
-                    print(f"Report log notification failed: {exc}")
+                    print(f"New report publication failed: {exc}")
 
             try:
                 await refresh_board()
@@ -299,7 +338,7 @@ class ReportReviewView(discord.ui.View):
             session["step"] = "review"
 
             message = (
-                "Kunde inte registrera ?rendet. F?rs?k igen."
+                "Kunde inte registrera ärendet. Försök igen."
                 if self.language == "sv"
                 else "Could not submit the report. Please try again."
             )
@@ -334,9 +373,105 @@ class ReportReviewView(discord.ui.View):
         clear_report_session(self.user_id)
 
         await interaction.response.edit_message(
-            content="Report cancelled. You can start a new report whenever you want.",
-            view=None,
+            content=(
+                "**RoomTask ? Report a fault or submit a request**\n"
+                "Choose your language to get started.\n"
+                "Välj språk för att komma igång."
+            ),
+            view=ReportPanelView(),
         )
+
+
+
+async def create_ticket_discussion(ticket: dict, report_message: discord.Message):
+    if not TASK_DISCUSSION_CHANNEL_ID:
+        raise RuntimeError("DISCORD_TASK_DISCUSSION_CHANNEL_ID is not configured")
+
+    channel = await client.fetch_channel(TASK_DISCUSSION_CHANNEL_ID)
+
+    thread = await channel.create_thread(
+        name=f"Report #{ticket['id']} - {ticket['title']}"[:100],
+        type=discord.ChannelType.public_thread,
+        auto_archive_duration=10080,
+        reason=f"Discussion for RoomTask report #{ticket['id']}",
+    )
+
+    await thread.send(
+        f"**Discussion for Report #{ticket['id']}**\n"
+        f"**Title:** {ticket['title']}\n"
+        f"**Room:** {ticket.get('room') or 'Unknown'}\n"
+        f"**Description:** {ticket.get('description') or 'No description provided.'}\n"
+        f"**Report card:** {report_message.jump_url}",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    await save_ticket_metadata(
+        ticket["id"],
+        discord_thread_id=str(thread.id),
+    )
+
+    return thread
+
+async def move_ticket_card(
+    ticket: dict,
+    discord_metadata: dict,
+    destination_channel_id: int,
+    interaction: discord.Interaction,
+    thread_update: str | None = None,
+):
+    if not destination_channel_id:
+        raise RuntimeError("Destination Discord channel is not configured")
+
+    destination = await client.fetch_channel(destination_channel_id)
+
+    new_message = await destination.send(
+        embed=build_ticket_embed(ticket),
+        view=build_ticket_action_view(ticket["id"], ticket["status"]),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    try:
+        await save_ticket_metadata(
+            ticket["id"],
+            discord_channel_id=str(destination.id),
+            discord_message_id=str(new_message.id),
+        )
+    except Exception:
+        await new_message.delete()
+        raise
+
+    old_channel_id = discord_metadata.get("channel_id")
+    old_message_id = discord_metadata.get("message_id")
+
+    if not old_channel_id or not old_message_id:
+        old_channel_id = str(interaction.channel_id)
+        old_message_id = str(interaction.message.id) if interaction.message else None
+
+    if old_message_id and (
+        str(old_channel_id) != str(destination.id)
+        or str(old_message_id) != str(new_message.id)
+    ):
+        try:
+            old_channel = await client.fetch_channel(int(old_channel_id))
+            old_message = await old_channel.fetch_message(int(old_message_id))
+            await old_message.delete()
+        except discord.NotFound:
+            pass
+        except Exception as exc:
+            print(f"Old report card could not be deleted: {exc}")
+
+    thread_id = discord_metadata.get("thread_id")
+    if thread_id and thread_update:
+        try:
+            thread = await client.fetch_channel(int(thread_id))
+            await thread.send(
+                thread_update,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as exc:
+            print(f"Discussion thread update failed: {exc}")
+
+    return new_message
 
 
 def build_ticket_embed(ticket: dict) -> discord.Embed:
@@ -428,19 +563,19 @@ class CompleteTicketModal(discord.ui.Modal):
                 interaction,
             )
 
-            channel = client.get_channel(self.channel_id)
-            if channel is None:
-                channel = await client.fetch_channel(self.channel_id)
-
-            message = await channel.fetch_message(self.message_id)
-
             ticket = result["ticket"]
+            discord_metadata = result.get("discord", {})
+            completion_description = str(self.completion_description).strip()
 
-            await message.edit(
-                embed=build_ticket_embed(ticket),
-                view=build_ticket_action_view(
-                    self.ticket_id,
-                    ticket["status"],
+            await move_ticket_card(
+                ticket=ticket,
+                discord_metadata=discord_metadata,
+                destination_channel_id=COMPLETED_TASKS_CHANNEL_ID,
+                interaction=interaction,
+                thread_update=(
+                    f"**Report #{self.ticket_id} completed** by "
+                    f"{interaction.user.mention}.\\n"
+                    f"**Work description:** {completion_description}"
                 ),
             )
 
@@ -534,12 +669,19 @@ class TicketActionButton(
             )
 
             ticket = result["ticket"]
+            discord_metadata = result.get("discord", {})
 
-            await interaction.message.edit(
-                embed=build_ticket_embed(ticket),
-                view=build_ticket_action_view(
-                    self.ticket_id,
-                    ticket["status"],
+            await move_ticket_card(
+                ticket=ticket,
+                discord_metadata=discord_metadata,
+                destination_channel_id=ACTIVE_TASKS_CHANNEL_ID,
+                interaction=interaction,
+                thread_update=(
+                    f"**Report #{self.ticket_id} claimed** by "
+                    f"{interaction.user.mention}."
+                    if self.action == "claim"
+                    else f"**Report #{self.ticket_id} reopened** by "
+                    f"{interaction.user.mention}."
                 ),
             )
 
@@ -586,10 +728,9 @@ class ReportLanguageView(discord.ui.View):
         session["language"] = "en"
         session["step"] = "type"
 
-        await interaction.response.send_message(
-            "What would you like to submit?",
+        await interaction.response.edit_message(
+            content="What would you like to submit?",
             view=ReportTypeView(self.user_id, "en"),
-            ephemeral=True,
         )
 
     @discord.ui.button(label="Svenska", style=discord.ButtonStyle.primary)
@@ -598,18 +739,22 @@ class ReportLanguageView(discord.ui.View):
         session["language"] = "sv"
         session["step"] = "type"
 
-        await interaction.response.send_message(
-            "Vad vill du skicka in?",
+        await interaction.response.edit_message(
+            content="Vad vill du skicka in?",
             view=ReportTypeView(self.user_id, "sv"),
-            ephemeral=True,
         )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         clear_report_session(self.user_id)
-        await interaction.response.send_message(
-            "Report cancelled. You can start a new report whenever you want.",
-            ephemeral=True,
+
+        await interaction.response.edit_message(
+            content=(
+                "**RoomTask ? Report a fault or submit a request**\n"
+                "Choose your language to get started.\n"
+                "Välj språk för att komma igång."
+            ),
+            view=ReportPanelView(),
         )
 
 
@@ -679,7 +824,7 @@ class ReportTypeView(discord.ui.View):
                 except Exception as exc:
                     print(f"Room selection failed: {exc}")
                     message = (
-                        "Kunde inte h?mta rummen. F?rs?k igen senare."
+                        "Kunde inte hämta rummen. Försök igen senare."
                         if self.language == "sv"
                         else "Could not load rooms. Please try again later."
                     )
@@ -715,19 +860,9 @@ class ReportTypeView(discord.ui.View):
         session = get_report_session(self.user_id)
         session["step"] = "language"
 
-        await interaction.response.send_message(
-            "Choose your language / V?lj spr?k:",
+        await interaction.response.edit_message(
+            content="Choose your language / Välj språk:",
             view=ReportLanguageView(self.user_id),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        clear_report_session(self.user_id)
-
-        await interaction.response.send_message(
-            "Report cancelled. You can start a new report whenever you want.",
-            ephemeral=True,
         )
 
 
@@ -736,7 +871,7 @@ class ReportPanelView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Submit a report / Skicka in ett ?rende",
+        label="Submit a report / Skicka in ett ärende",
         style=discord.ButtonStyle.primary,
         custom_id="roomtask:report:open",
     )
@@ -763,7 +898,7 @@ class ReportPanelView(discord.ui.View):
         }
 
         await interaction.response.send_message(
-            "Choose your language / V?lj spr?k:",
+            "Choose your language / Välj språk:",
             view=ReportLanguageView(user_id),
             ephemeral=True,
         )
@@ -932,7 +1067,7 @@ async def report(interaction: discord.Interaction):
     }
 
     await interaction.response.send_message(
-        "Choose your language / V?lj spr?k:",
+        "Choose your language / Välj språk:",
         view=ReportLanguageView(user_id),
         ephemeral=True,
     )
