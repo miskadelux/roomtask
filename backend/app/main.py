@@ -18,6 +18,7 @@ from .schemas import (
     RoomIn,
     CommentIn,
     CompleteTicketIn,
+    ReopenTicketIn,
     UserIn,
     UserUpdateIn,
     UserPasswordIn,
@@ -410,11 +411,16 @@ def discord_add_comment(
 @app.post("/api/internal/discord/tickets/{ticket_id}/reopen")
 def discord_reopen_ticket(
     ticket_id: int,
+    data: ReopenTicketIn,
     user: User = Depends(discord_bot_user),
     db: Session = Depends(get_db),
 ):
     if user.role != "admin":
         raise HTTPException(403, "Only administrators can reopen tasks")
+
+    reason = data.reason.strip()
+    if not reason:
+        raise HTTPException(422, "A reopening reason is required")
 
     ticket = db.get(Ticket, ticket_id)
 
@@ -433,7 +439,7 @@ def discord_reopen_ticket(
         "reopened_after_admin_discussion",
         user.username,
         user.id,
-        details="Task reopened by an administrator through Discord."
+        details=f"Task reopened by an administrator. Reason: {reason}"
     )
 
     db.commit()

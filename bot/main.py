@@ -172,13 +172,15 @@ class ReportModal(discord.ui.Modal):
         if (
             interaction.user.id != self.user_id
             or not session
-            or session.get("step") != "form"
+            or session.get("step") != "type"
         ):
             await interaction.response.send_message(
                 "This report session has expired. Please start again.",
                 ephemeral=True,
             )
             return
+
+        session["step"] = "form"
 
         room_id = self.room_select.values[0]
         selected_room = self.rooms_by_id.get(room_id)
@@ -620,6 +622,80 @@ class CompleteTicketModal(discord.ui.Modal):
             )
 
 
+class ReopenTicketModal(discord.ui.Modal):
+    def __init__(self, ticket_id: int):
+        super().__init__(title="Reopen report")
+
+        self.ticket_id = ticket_id
+
+        self.reason = discord.ui.TextInput(
+            label="Reason for reopening",
+            placeholder="Explain why this report needs to be reopened...",
+            style=discord.TextStyle.paragraph,
+            min_length=1,
+            max_length=1000,
+        )
+
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = str(self.reason).strip()
+
+        if not reason:
+            await interaction.response.send_message(
+                "A reason for reopening is required.",
+                ephemeral=True,
+            )
+            return
+
+        if self.action == "reopen":
+            await interaction.response.send_modal(
+                ReopenTicketModal(self.ticket_id)
+            )
+            return
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+
+            await internal_request(
+                "POST",
+                f"/api/internal/discord/tickets/{self.ticket_id}/reopen",
+                interaction,
+                json={"reason": reason},
+            )
+
+            result = await internal_request(
+                "GET",
+                f"/api/internal/discord/tickets/{self.ticket_id}",
+                interaction,
+            )
+
+            await move_ticket_card(
+                ticket=result["ticket"],
+                discord_metadata=result.get("discord", {}),
+                destination_channel_id=ACTIVE_TASKS_CHANNEL_ID,
+                interaction=interaction,
+                thread_update=(
+                    f"**Report #{self.ticket_id} reopened** by "
+                    f"{interaction.user.mention}.\\n"
+                    f"**Reason:** {reason}"
+                ),
+                history=result.get("history", []),
+            )
+
+            await interaction.followup.send(
+                "Report successfully reopened.",
+                ephemeral=True,
+            )
+
+        except Exception as exc:
+            print(f"Ticket reopening failed: {exc}")
+            await interaction.followup.send(
+                f"Could not reopen report: {exc}",
+                ephemeral=True,
+            )
+
+
 class TicketActionButton(
     discord.ui.DynamicItem[discord.ui.Button],
     template=r"roomtask:ticket:(?P<action>claim|complete|reopen):(?P<ticket_id>[0-9]+)",
@@ -842,8 +918,6 @@ class ReportTypeView(discord.ui.View):
                             ephemeral=True,
                         )
                         return
-
-                    session["step"] = "form"
 
                     await interaction.response.send_modal(
                         ReportModal(report_kind, self.language, rooms, self.user_id)
