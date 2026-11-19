@@ -13,6 +13,7 @@ NEW_REPORTS_CHANNEL_ID = int(os.getenv("DISCORD_NEW_REPORTS_CHANNEL_ID", "0") or
 ACTIVE_TASKS_CHANNEL_ID = int(os.getenv("DISCORD_ACTIVE_TASKS_CHANNEL_ID", "0") or 0)
 COMPLETED_TASKS_CHANNEL_ID = int(os.getenv("DISCORD_COMPLETED_TASKS_CHANNEL_ID", "0") or 0)
 TASK_DISCUSSION_CHANNEL_ID = int(os.getenv("DISCORD_TASK_DISCUSSION_CHANNEL_ID", "0") or 0)
+ADMIN_ROLE_ID = int(os.getenv("DISCORD_ADMIN_ROLE_ID", "0") or 0)
 BOARD_API_KEY = os.getenv("DISCORD_BOARD_API_KEY", "")
 BOT_API_KEY = os.getenv("DISCORD_BOT_API_KEY", "")
 BOARD_REFRESH_SECONDS = max(30, int(os.getenv("DISCORD_BOARD_REFRESH_SECONDS", "60")))
@@ -648,12 +649,6 @@ class ReopenTicketModal(discord.ui.Modal):
             )
             return
 
-        if self.action == "reopen":
-            await interaction.response.send_modal(
-                ReopenTicketModal(self.ticket_id)
-            )
-            return
-
         try:
             await interaction.response.defer(ephemeral=True)
 
@@ -746,6 +741,33 @@ class TicketActionButton(
                     interaction.channel_id,
                     interaction.message.id,
                 )
+            )
+            return
+
+        if self.action == "reopen":
+            try:
+                permissions = await internal_request(
+                    "GET",
+                    "/api/internal/discord/permissions",
+                    interaction,
+                )
+
+                if not permissions.get("is_admin", False):
+                    await interaction.response.send_message(
+                        "Only RoomTask administrators can reopen reports.",
+                        ephemeral=True,
+                    )
+                    return
+
+            except Exception:
+                await interaction.response.send_message(
+                    "Could not verify your RoomTask permissions. Please try again.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.send_modal(
+                ReopenTicketModal(self.ticket_id)
             )
             return
 

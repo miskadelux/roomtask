@@ -208,6 +208,16 @@ def discord_bot_user(
 
     return user
 
+@app.get("/api/internal/discord/permissions")
+def discord_get_permissions(
+    user: User = Depends(discord_bot_user),
+):
+    return {
+        "role": user.role,
+        "is_admin": user.role == "admin",
+    }
+
+
 @app.post("/api/internal/discord/tickets/{ticket_id}/claim")
 def discord_claim_ticket(
     ticket_id: int,
